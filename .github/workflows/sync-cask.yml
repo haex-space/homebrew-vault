@@ -1,0 +1,117 @@
+name: Sync Cask
+
+# Pull-based update: this workflow polls haex-vault's latest GitHub release
+# and rewrites Casks/haex-vault.rb when a new version appears. Runs in this
+# repo and only writes to this repo, so the auto-provisioned GITHUB_TOKEN
+# is sufficient — no PAT, no cross-repo auth.
+
+on:
+  schedule:
+    # Every 30 minutes. Homebrew users run `brew update` ad-hoc; sub-hour
+    # latency is plenty for them. Cron is the failsafe — workflow_dispatch
+    # exists for instant manual triggers after a release.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run even if cask version already matches latest release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# One sync at a time. cancel-in-progress=false because a half-finished
+# rewrite is worse than a delayed retry.
+concurrency:
+  group: sync-cask
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Discover latest haex-vault release
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(gh api repos/haex-space/haex-vault/releases/latest --jq '.tag_name')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::warning::No haex-vault release found"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against current cask version
+        id: diff
+        env:
+          TARGET: ${{ steps.target.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          current=$(grep -E '^\s*version\s+"' Casks/haex-vault.rb | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "current=$current target=$TARGET force=$FORCE"
+          if [ "$current" = "$TARGET" ] && [ "$FORCE" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Cask already at $TARGET — nothing to do"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download .dmg assets and compute SHA256
+        if: steps.diff.outputs.skip != 'true'
+        id: hashes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          tmp=$(mktemp -d)
+          gh release download "$TAG" \
+            --repo haex-space/haex-vault \
+            --pattern '*.dmg' \
+            --dir "$tmp"
+
+          arm=$(ls "$tmp"/*aarch64*.dmg 2>/dev/null | head -1)
+          intel=$(ls "$tmp"/*x64*.dmg 2>/dev/null | head -1)
+
+          if [ -z "$arm" ] || [ -z "$intel" ]; then
+            echo "::error::Release $TAG is missing a macOS .dmg asset (aarch64=$arm intel=$intel)"
+            exit 1
+          fi
+
+          echo "arm_sha=$(sha256sum "$arm" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "intel_sha=$(sha256sum "$intel" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite cask file
+        if: steps.diff.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          ARM_SHA: ${{ steps.hashes.outputs.arm_sha }}
+          INTEL_SHA: ${{ steps.hashes.outputs.intel_sha }}
+        run: |
+          file=Casks/haex-vault.rb
+          sed -i -E "s|(  version\s+)\"[^\"]+\"|\1\"$VERSION\"|" "$file"
+          sed -i -E "s|(sha256\s+arm:\s+)\"[^\"]+\"|\1\"$ARM_SHA\"|" "$file"
+          sed -i -E "s|(intel:\s+)\"[^\"]+\"|\1\"$INTEL_SHA\"|" "$file"
+
+          echo "--- rewritten cask ---"
+          cat "$file"
+
+      - name: Commit and push
+        if: steps.diff.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/haex-vault.rb
+          if git diff --staged --quiet; then
+            echo "::warning::No diff after rewrite — sed patterns might be out of sync with cask layout"
+            exit 0
+          fi
+          git commit -m "chore: bump haex-vault to v$VERSION"
+          git push
