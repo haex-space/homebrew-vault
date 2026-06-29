@@ -1,7 +1,7 @@
 cask "haex-vault" do
-  version "2.12.0"
-  sha256 arm:   "d0b4b8033ca6c9697a84bd9a69a88d358a018ad195a8cfe49d3339735cca54e8",
-         intel: "5d76de19f7eae64e829145c6a0f6943e0ca63097de3b7f98225c72efdfeb4c45"
+  version "2.12.1"
+  sha256 arm:   "250c398bcc6e6e9eb3684ffee04c52fa246c778350a0f405ccd51358aa7b30e5",
+         intel: "a60b01823f6dafd7b6cfd449d62ce8042d62db504c7d0cc31fe91c9de89e1529"
 
   url "https://github.com/haex-space/haex-vault/releases/download/v#{version}/Haex.Vault_#{version}_#{Hardware::CPU.intel? ? "x64" : "aarch64"}.dmg",
       verified: "github.com/haex-space/haex-vault/"
