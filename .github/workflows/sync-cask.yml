@@ -69,25 +69,39 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
+          # Probe the release's asset list FIRST. `gh release download` itself
+          # exits non-zero on "no assets to download", which under `bash -e`
+          # would kill the step before our soft-fail path runs. The probe is a
+          # plain API call — auth/network errors still propagate as real
+          # failures.
+          assets=$(gh api "repos/haex-space/haex-vault/releases/tags/$TAG" --jq '[.assets[].name] | join(" ")')
+          arm_name=$(echo "$assets" | tr ' ' '\n' | grep -E 'aarch64.*\.dmg$' | head -1 || true)
+          intel_name=$(echo "$assets" | tr ' ' '\n' | grep -E 'x64.*\.dmg$' | head -1 || true)
+
+          if [ -z "$arm_name" ] || [ -z "$intel_name" ]; then
+            # haex-vault tags the release before the Build workflow finishes
+            # uploading the .dmg assets (~1h20m gap). Soft-fail so the cron
+            # simply retries 30min later instead of marking the run as failed.
+            echo "::warning::Release $TAG has no macOS .dmg yet (aarch64=$arm_name intel=$intel_name) — haex-vault Build still running; next cron will retry"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           tmp=$(mktemp -d)
           gh release download "$TAG" \
             --repo haex-space/haex-vault \
             --pattern '*.dmg' \
             --dir "$tmp"
 
-          arm=$(ls "$tmp"/*aarch64*.dmg 2>/dev/null | head -1)
-          intel=$(ls "$tmp"/*x64*.dmg 2>/dev/null | head -1)
+          arm="$tmp/$arm_name"
+          intel="$tmp/$intel_name"
 
-          if [ -z "$arm" ] || [ -z "$intel" ]; then
-            echo "::error::Release $TAG is missing a macOS .dmg asset (aarch64=$arm intel=$intel)"
-            exit 1
-          fi
-
+          echo "ready=true" >> "$GITHUB_OUTPUT"
           echo "arm_sha=$(sha256sum "$arm" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "intel_sha=$(sha256sum "$intel" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Rewrite cask file
-        if: steps.diff.outputs.skip != 'true'
+        if: steps.diff.outputs.skip != 'true' && steps.hashes.outputs.ready == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
           ARM_SHA: ${{ steps.hashes.outputs.arm_sha }}
@@ -102,7 +116,7 @@ jobs:
           cat "$file"
 
       - name: Commit and push
-        if: steps.diff.outputs.skip != 'true'
+        if: steps.diff.outputs.skip != 'true' && steps.hashes.outputs.ready == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
         run: |
